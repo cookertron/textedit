@@ -241,10 +241,8 @@ main:
 .ck_right:
     CMP     AH, SCAN_RIGHT
     JNE     .ck_pgdn
-    CALL    line_length          ; AX = visible chars on cur_line
-    MOV     BX, [cur_col]
-    CMP     BX, AX
-    JAE     .evloop              ; already at or past EOL — do nothing
+    CALL    peek_at_cursor
+    JZ      .evloop
     INC     WORD [cur_col]
     JMP     .cursor_moved
 
@@ -298,7 +296,17 @@ main:
 
 .cursor_moved:
     MOV     WORD [last_ins_pi], 0FFFFh
+    MOV     AX, [top_line]
+    PUSH    AX
     CALL    scroll_to_cursor
+    POP     AX
+    CMP     AX, [top_line]
+    JNE     .cursor_scrolled
+    ; No scroll — only update status bar and hardware cursor
+    CALL    repaint_status
+    CALL    update_cursor
+    JMP     .evloop
+.cursor_scrolled:
     CALL    render
     CALL    update_cursor
     JMP     .evloop
@@ -398,12 +406,12 @@ main:
     INC     SI
     JMP     .qp_loop
 .qp_pad:
-    CMP     DI, SCREEN_ROWS * SCREEN_COLS * 2
-    JAE     .qp_done
-    MOV     BYTE ES:[DI], ' '
-    MOV     BYTE ES:[DI+1], ATTR_STAT
-    ADD     DI, 2
-    JMP     .qp_pad
+    MOV     CX, SCREEN_ROWS * SCREEN_COLS * 2
+    SUB     CX, DI
+    JBE     .qp_done
+    SHR     CX, 1
+    MOV     AX, 7020h
+    REP     STOSW
 .qp_done:
     POP     SI
     POP     DI
@@ -523,9 +531,13 @@ line_length PROC
 
     MOV     AX, [cur_line]
     CALL    seek_to_line
-    XOR     CX, CX            ; column counter
+    XOR     CX, CX            ; CX = visible char count
 
-.ll_piece:
+    CMP     BYTE [wrap_mode], 0
+    JNE     .ll_piece_wrap
+
+    ; ---- NON-WRAP FAST PATH ----
+.ll_piece_fast:
     MOV     BX, [rnd_pi]
     CMP     BX, [pt_count]
     JAE     .ll_done
@@ -534,34 +546,93 @@ line_length PROC
     POP     CX
     JC      .ll_done
 
+    PUSH    ES
+    MOV     ES, AX
+    MOV     DI, SI
+    ADD     DI, [rnd_off]      ; ES:DI = start of scan within piece
+    MOV     BX, DI             ; BX = saved start position
+
+    PUSH    CX
+    MOV     CX, SI
+    ADD     CX, DX
+    SUB     CX, DI             ; CX = bytes from offset to piece end
+    MOV     AL, 0Ah
+    REPNE   SCASB
+    POP     CX                 ; restore visible char counter
+    JE      .ll_found_lf
+
+    ; No LF in piece: count bytes in range, subtract trailing CR.
+    MOV     AX, DI
+    SUB     AX, BX             ; AX = bytes scanned (all of them, no LF)
+    MOV     BX, DI
+    DEC     BX                 ; BX = last byte scanned
+    CMP     BYTE ES:[BX], 0Dh
+    JNE     .ll_no_trail_cr
+    DEC     AX
+.ll_no_trail_cr:
+    ADD     CX, AX
+    POP     ES
+    INC     WORD [rnd_pi]
+    MOV     WORD [rnd_off], 0
+    JMP     .ll_piece_fast
+
+.ll_found_lf:
+    ; DI = byte after LF. BX = start of scan.
+    MOV     AX, DI
+    SUB     AX, BX
+    DEC     AX                 ; AX = bytes between start and LF
+
+    ; Check for CR immediately before LF
+    TEST    AX, AX
+    JZ      .ll_no_cr
+    MOV     BX, DI
+    SUB     BX, 2              ; BX = byte before LF
+    CMP     BYTE ES:[BX], 0Dh
+    JNE     .ll_no_cr
+    DEC     AX
+.ll_no_cr:
+    ADD     CX, AX
+    POP     ES
+    JMP     .ll_done
+
+    ; ---- WRAP MODE: original byte-by-byte scan ----
+.ll_piece_wrap:
+    MOV     BX, [rnd_pi]
+    CMP     BX, [pt_count]
+    JAE     .ll_done
+    PUSH    CX
+    CALL    resolve_piece
+    POP     CX
+    JC      .ll_done
+
     PUSH    DS
     MOV     DS, AX
-    MOV     DI, SI             ; DI = base
-    ADD     DX, SI             ; DX = chunk end
+    MOV     DI, SI
+    ADD     DX, SI
     MOV     SI, DI
     ADD     SI, CS:[rnd_off]
 
-.ll_inner:
+.ll_inner_wrap:
     CMP     SI, DX
-    JAE     .ll_next
+    JAE     .ll_next_wrap
     MOV     AL, [SI]
     INC     SI
     CMP     AL, 0Dh
-    JE      .ll_inner
+    JE      .ll_inner_wrap
     CMP     AL, 0Ah
-    JE      .ll_eol
+    JE      .ll_eol_wrap
     INC     CX
-    JMP     .ll_inner
+    JMP     .ll_inner_wrap
 
-.ll_eol:
+.ll_eol_wrap:
     POP     DS
     JMP     .ll_done
 
-.ll_next:
+.ll_next_wrap:
     POP     DS
     INC     WORD [rnd_pi]
     MOV     WORD [rnd_off], 0
-    JMP     .ll_piece
+    JMP     .ll_piece_wrap
 
 .ll_done:
     MOV     AX, CX
@@ -572,6 +643,42 @@ line_length PROC
     POP     BX
     RET
 line_length ENDP
+
+; ============================================================
+; PEEK_AT_CURSOR — check if character at cursor pos is past EOL
+; Output: ZF=1 if at or past end of line (EOL/EOF), ZF=0 if not
+; Clobbers: AX, BX, CX, DX, SI, DI
+; ============================================================
+
+peek_at_cursor PROC
+    CALL    cursor_to_offset
+
+    MOV     BX, [rnd_pi]
+    CMP     BX, [pt_count]
+    JAE     .at_eol
+
+    CALL    resolve_piece
+    JC      .at_eol
+
+    MOV     CX, [rnd_off]
+    CMP     CX, DX
+    JAE     .at_eol
+
+    PUSH    DS
+    MOV     DS, AX
+    ADD     SI, CX
+    MOV     AL, [SI]
+    POP     DS
+
+    CMP     AL, 0Ah
+    JE      .at_eol
+
+    RET
+
+.at_eol:
+    XOR     AX, AX
+    RET
+peek_at_cursor ENDP
 
 ; ============================================================
 ; INSERT_CHAR — insert AL at cursor position
@@ -609,12 +716,10 @@ insert_char PROC
     MOV     DS, AX
 
     ; Compute descriptor offset = BX * 10
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX                 ; DI = BX * 10
 
@@ -660,12 +765,10 @@ insert_char PROC
     MOV     DS, AX
 
     ; Compute descriptor offset = BX * 10
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX            ; DI = BX * 10
 
@@ -712,12 +815,10 @@ insert_char PROC
     ; Write right piece descriptor at slot BX
     MOV     AX, [pt_seg]
     MOV     ES, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX                      ; DI = BX * 10
 
@@ -745,12 +846,10 @@ insert_char PROC
     ; Write new char piece at slot BX
     MOV     AX, [pt_seg]
     MOV     ES, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     MOV     BYTE ES:[DI + PT_F_SOURCE], 1
@@ -789,12 +888,10 @@ insert_char PROC
     MOV     AX, [pt_seg]
     MOV     ES, AX
     ; Recompute DI for piece BX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     MOV     BYTE ES:[DI + PT_F_SOURCE], 1
@@ -816,7 +913,6 @@ insert_char PROC
     JE      .ic_done
     INC     WORD [cur_col]
     CALL    scroll_to_cursor
-    MOV     BYTE [meta_dirty], 1
     CALL    render
     CALL    update_cursor
     JMP     .ic_done
@@ -830,12 +926,10 @@ insert_char PROC
     PUSH    ES
     MOV     AX, [pt_seg]
     MOV     ES, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     MOV     BYTE ES:[DI + PT_F_SOURCE], 1
@@ -856,7 +950,6 @@ insert_char PROC
     JE      .ic_done
     INC     WORD [cur_col]
     CALL    scroll_to_cursor
-    MOV     BYTE [meta_dirty], 1
     CALL    render
     CALL    update_cursor
 
@@ -907,12 +1000,10 @@ insert_crlf PROC
     PUSH    DS
     MOV     AX, [pt_seg]
     MOV     DS, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     MOV     DX, [DI + PT_F_LENGTH]
@@ -949,12 +1040,10 @@ insert_crlf PROC
     ; Write right piece at BX
     MOV     AX, [pt_seg]
     MOV     ES, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     POP     AX                          ; source
@@ -997,12 +1086,10 @@ insert_crlf PROC
     PUSH    ES
     MOV     AX, [pt_seg]
     MOV     ES, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     MOV     BYTE ES:[DI + PT_F_SOURCE], 1
@@ -1159,30 +1246,36 @@ pt_insert PROC
     SUB     CX, BX
     JCXZ    .no_move
 
-    ; Byte count = CX * PT_DESC_SIZE
+    ; Word count = CX * PT_DESC_SIZE / 2
     MOV     AX, CX
     MOV     DX, PT_DESC_SIZE
     MUL     DX
-    MOV     CX, AX            ; CX = bytes to move
+    SHR     AX, 1
+    MOV     CX, AX            ; CX = words to move
 
-    ; Source end = (pt_count - 1) * 10 + 9
+    ; Source: start of last WORD = (pt_count - 1) * 10 + 8
     MOV     AX, CS:[pt_count]
     DEC     AX
     MOV     DX, PT_DESC_SIZE
     MUL     DX
-    ADD     AX, PT_DESC_SIZE - 1
+    ADD     AX, PT_DESC_SIZE - 2
     MOV     SI, AX
 
-    ; Dest end = SI + 10
+    ; Dest: SI + 10
     MOV     DI, SI
     ADD     DI, PT_DESC_SIZE
 
     STD
-    REP     MOVSB
+    REP     MOVSW
     CLD
 
 .no_move:
     INC     WORD CS:[pt_count]
+    PUSH    DS
+    PUSH    CS
+    POP     DS
+    CALL    chkpt_adjust_insert
+    POP     DS
 
     POP     DX
     POP     AX
@@ -1198,6 +1291,35 @@ pt_insert PROC
     STC
     RET
 pt_insert ENDP
+
+; ============================================================
+; CHKPT_ADJUST_INSERT — adjust checkpoint piece indices after
+; a pt_insert at index BX.  All chkpt_pi[i] >= BX get +1.
+; Preserves all registers.
+; ============================================================
+
+chkpt_adjust_insert PROC
+    PUSH    AX
+    PUSH    CX
+    PUSH    SI
+    MOV     CX, [chkpt_num]
+    XOR     SI, SI
+.loop:
+    JCXZ    .done
+    MOV     AX, [SI + chkpt_pi]
+    CMP     AX, BX
+    JB      .next
+    INC     WORD [SI + chkpt_pi]
+.next:
+    ADD     SI, 2
+    DEC     CX
+    JMP     .loop
+.done:
+    POP     SI
+    POP     CX
+    POP     AX
+    RET
+chkpt_adjust_insert ENDP
 
 ; ============================================================
 ; PT_REMOVE — remove descriptor at index BX
@@ -1227,19 +1349,18 @@ pt_remove PROC
     SUB     CX, BX
     JCXZ    .no_move
 
-    ; Byte count = CX * PT_DESC_SIZE
+    ; Word count = CX * PT_DESC_SIZE / 2
     MOV     AX, CX
     MOV     DX, PT_DESC_SIZE
     MUL     DX
-    MOV     CX, AX            ; CX = bytes to move
+    SHR     AX, 1
+    MOV     CX, AX            ; CX = words to move
 
     ; Dest = BX * 10
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX            ; DI = BX * 10
 
@@ -1248,10 +1369,15 @@ pt_remove PROC
     ADD     SI, PT_DESC_SIZE
 
     CLD
-    REP     MOVSB
+    REP     MOVSW
 
 .no_move:
     DEC     WORD CS:[pt_count]
+    PUSH    DS
+    PUSH    CS
+    POP     DS
+    CALL    chkpt_adjust_remove
+    POP     DS
 
     POP     DX
     POP     AX
@@ -1263,6 +1389,35 @@ pt_remove PROC
 .done:
     RET
 pt_remove ENDP
+
+; ============================================================
+; CHKPT_ADJUST_REMOVE — adjust checkpoint piece indices after
+; a pt_remove at index BX.  All chkpt_pi[i] > BX get -1.
+; Preserves all registers.
+; ============================================================
+
+chkpt_adjust_remove PROC
+    PUSH    AX
+    PUSH    CX
+    PUSH    SI
+    MOV     CX, [chkpt_num]
+    XOR     SI, SI
+.loop:
+    JCXZ    .done
+    MOV     AX, [SI + chkpt_pi]
+    CMP     AX, BX
+    JBE     .next
+    DEC     WORD [SI + chkpt_pi]
+.next:
+    ADD     SI, 2
+    DEC     CX
+    JMP     .loop
+.done:
+    POP     SI
+    POP     CX
+    POP     AX
+    RET
+chkpt_adjust_remove ENDP
 
 ; ============================================================
 ; DELETE_BYTE — delete 1 byte at {rnd_pi, rnd_off}
@@ -1291,12 +1446,10 @@ delete_byte PROC
     PUSH    DS
     MOV     AX, [pt_seg]
     MOV     DS, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX            ; DI = BX * 10
     MOV     DX, [DI + PT_F_LENGTH]
@@ -1329,12 +1482,10 @@ delete_byte PROC
     PUSH    DS
     MOV     AX, [pt_seg]
     MOV     DS, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     MOV     AX, [DI + PT_F_START]
@@ -1352,12 +1503,10 @@ delete_byte PROC
     PUSH    DS
     MOV     AX, [pt_seg]
     MOV     DS, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
     DEC     WORD [DI + PT_F_LENGTH]
@@ -1370,12 +1519,10 @@ delete_byte PROC
     PUSH    DS
     MOV     AX, [pt_seg]
     MOV     ES, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
 
@@ -1410,12 +1557,10 @@ delete_byte PROC
     ; Write right piece descriptor
     MOV     AX, [pt_seg]
     MOV     ES, AX
-    MOV     AX, BX
-    PUSH    CX
-    MOV     CL, 3
-    SHL     AX, CL
-    POP     CX
     MOV     DI, BX
+    SHL     DI, 1
+    MOV     AX, DI
+    SHL     DI, 1
     SHL     DI, 1
     ADD     DI, AX
 
@@ -1598,21 +1743,82 @@ save_file PROC
 
     MOV     BP, AX             ; BP = file handle
 
-    ; Walk pieces 0..pt_count-1
+    ; Walk pieces, coalescing contiguous same-segment runs.
     XOR     DI, DI             ; DI = piece index
-.sf_loop:
+
+    ; Resolve first piece to seed the pending write
     CMP     DI, [pt_count]
-    JAE     .sf_close
+    JAE     .sf_close_ok
+    MOV     BX, DI
+    CALL    resolve_piece      ; AX=seg, SI=base, DX=piece_len
+    JC      .sf_close_ok
+
+    ; Seed pending write: segment AX, offset SI, length DX
+    PUSH    AX                 ; [stk] = pending segment
+    MOV     [rnd_base], SI     ; pending start offset
+    MOV     [rnd_len], DX      ; pending length
+    INC     DI
+
+.sf_coalesce:
+    CMP     DI, [pt_count]
+    JAE     .sf_flush           ; no more pieces — flush pending
 
     MOV     BX, DI
     CALL    resolve_piece      ; AX=seg, SI=base, DX=piece_len
-    JC      .sf_close
+    JC      .sf_flush
 
-    ; Write DX bytes from AX:SI to file
-    MOV     CX, DX             ; CX = bytes to write
-    MOV     DS, AX             ; DS = source segment
-    MOV     DX, SI             ; DS:DX = data start
-    MOV     BX, BP             ; BX = file handle
+    ; Check if this piece is contiguous with pending write
+    POP     BX                 ; BX = pending segment
+    PUSH    BX
+    CMP     AX, BX
+    JNE     .sf_break          ; different segment
+
+    MOV     BX, [rnd_base]
+    ADD     BX, [rnd_len]      ; BX = pending end offset
+    CMP     SI, BX
+    JNE     .sf_break          ; not contiguous
+
+    ; Contiguous — extend pending write
+    ADD     [rnd_len], DX
+    INC     DI
+    JMP     .sf_coalesce
+
+.sf_break:
+    ; Flush pending write, then seed new one from current piece
+    POP     BX                 ; BX = pending segment (consumed)
+
+    PUSH    AX                 ; save current piece segment
+    PUSH    SI                 ; save current piece base
+    PUSH    DX                 ; save current piece length
+
+    MOV     DS, BX
+    MOV     DX, CS:[rnd_base]
+    MOV     CX, CS:[rnd_len]
+    MOV     BX, BP
+    MOV     AH, 40h
+    INT     21h
+
+    PUSH    CS
+    POP     DS
+    JC      .sf_break_err
+
+    POP     DX                 ; current piece length
+    POP     SI                 ; current piece base
+    POP     AX                 ; current piece segment
+
+    PUSH    AX                 ; push new pending segment
+    MOV     [rnd_base], SI
+    MOV     [rnd_len], DX
+    INC     DI
+    JMP     .sf_coalesce
+
+.sf_flush:
+    ; Write final pending block
+    POP     BX                 ; BX = pending segment
+    MOV     DS, BX
+    MOV     DX, CS:[rnd_base]
+    MOV     CX, CS:[rnd_len]
+    MOV     BX, BP
     MOV     AH, 40h
     INT     21h
 
@@ -1620,10 +1826,7 @@ save_file PROC
     POP     DS
     JC      .sf_err
 
-    INC     DI
-    JMP     .sf_loop
-
-.sf_close:
+.sf_close_ok:
     PUSH    CS
     POP     DS
     MOV     BX, BP
@@ -1631,6 +1834,10 @@ save_file PROC
     INT     21h
     MOV     BYTE [dirty], 0
     JMP     .sf_done
+
+.sf_break_err:
+    ADD     SP, 6              ; discard 3 saved words
+    ; fall through to sf_err
 
 .sf_err:
     PUSH    CS
@@ -1907,10 +2114,10 @@ resolve_piece PROC
     MOV     AX, [pt_seg]
     MOV     ES, AX
     ; SI = BX * 10
-    MOV     AX, BX
-    MOV     CL, 3
-    SHL     AX, CL
     MOV     SI, BX
+    SHL     SI, 1
+    MOV     AX, SI
+    SHL     SI, 1
     SHL     SI, 1
     ADD     SI, AX
     ; Read length
@@ -1983,36 +2190,75 @@ rebuild_meta PROC
     MOV     DI, SI
     ADD     DI, DX
     INC     BP
-.byte_loop:
+
+    CMP     BYTE [wrap_mode], 0
+    JNE     .byte_loop_wrap        ; wrap mode: use original byte loop
+
+    ; ---- NON-WRAP FAST PATH: REPNE SCASB ----
+    MOV     DI, SI                 ; DI = scan start = piece base
+    ADD     DX, SI                 ; DX = piece end (absolute)
+    MOV     AL, 0Ah                ; search for LF
+
+.rm_scas_loop:
+    MOV     CX, DX
+    SUB     CX, DI                 ; CX = bytes remaining in piece
+    JCXZ    .rm_exhaust            ; piece exhausted
+
+    REPNE   SCASB                  ; scan for LF; DI advances past match
+    JNE     .rm_exhaust            ; no LF found — piece done
+
+    ; Found LF at DI-1. DI now points to byte after LF.
+    MOV     WORD [stl_col], 0
+    INC     WORD [total_lines]
+    MOV     AX, [total_lines]
+    TEST    AX, CHKPT_INTERVAL - 1
+    MOV     AL, 0Ah                ; restore search byte (AX was clobbered)
+    JNZ     .rm_scas_loop          ; not a checkpoint boundary
+
+    ; Record checkpoint — swap SI/DI for .record_chkpt's convention
+    PUSH    SI                     ; save piece base
+    MOV     SI, DI                 ; SI = current scan position (past LF)
+    PUSH    DI                     ; save scan position
+    MOV     DI, DX                 ; DI = piece end (what record_chkpt expects)
+    CALL    .record_chkpt
+    POP     DI                     ; restore scan position
+    POP     SI                     ; restore piece base
+    MOV     AL, 0Ah                ; restore search byte (clobbered by record_chkpt)
+    JMP     .rm_scas_loop
+
+.rm_exhaust:
+    JMP     .end_walk
+
+    ; ---- WRAP MODE: original byte-by-byte loop ----
+.byte_loop_wrap:
     CMP     SI, DI
     JAE     .end_walk
     MOV     AL, ES:[SI]
     INC     SI
     CMP     AL, 0Dh
-    JE      .byte_loop
+    JE      .byte_loop_wrap
     CMP     AL, 0Ah
-    JNE     .not_lf
+    JNE     .not_lf_wrap
     MOV     WORD [stl_col], 0
     INC     WORD [total_lines]
     MOV     AX, [total_lines]
     TEST    AX, CHKPT_INTERVAL - 1
-    JNZ     .byte_loop
+    JNZ     .byte_loop_wrap
     CALL    .record_chkpt
-    JMP     .byte_loop
-.not_lf:
+    JMP     .byte_loop_wrap
+.not_lf_wrap:
     INC     WORD [stl_col]
-    CMP     BYTE [wrap_mode], 0
-    JE      .byte_loop
     MOV     AX, [stl_col]
     CMP     AX, SCREEN_COLS
-    JB      .byte_loop
+    JB      .byte_loop_wrap
     MOV     WORD [stl_col], 0
     INC     WORD [total_lines]
     MOV     AX, [total_lines]
     TEST    AX, CHKPT_INTERVAL - 1
-    JNZ     .byte_loop
+    JNZ     .byte_loop_wrap
     CALL    .record_chkpt
-    JMP     .byte_loop
+    JMP     .byte_loop_wrap
+
 .end_walk:
     JMP     .next_piece
 .done:
@@ -2110,56 +2356,106 @@ seek_to_line:
     POP     CX
     JC      .stl_page_err
     MOV     [rnd_base], SI
-    ADD     DX, SI
+    ADD     DX, SI                 ; DX = piece end (absolute)
+
+    CMP     BYTE [wrap_mode], 0
+    JNE     .stl_inner_wrap        ; wrap mode: use byte-by-byte loop
+
+    ; ---- NON-WRAP FAST PATH: REPNE SCASB for LF scanning ----
+    PUSH    ES
+    MOV     ES, AX                 ; ES = text segment
+    MOV     DI, SI
+    ADD     DI, [rnd_off]          ; ES:DI = start position in text
+
+    MOV     BX, CX                 ; BX = lines remaining (save CX for REPNE)
+    MOV     AL, 0Ah                ; search for LF
+
+.stl_scas_loop:
+    MOV     CX, DX
+    SUB     CX, DI                 ; CX = bytes remaining in piece
+    JCXZ    .stl_scas_next         ; piece exhausted
+    REPNE   SCASB                  ; scan for 0Ah; DI advances past match
+    JNE     .stl_scas_next         ; not found in piece
+    ; Found LF. DI = byte after the LF.
+    DEC     BX                     ; one less line to skip
+    JZ      .stl_scas_found
+    JMP     .stl_scas_loop
+
+.stl_scas_next:
+    ; Piece exhausted without finding enough LFs
+    POP     ES
+    MOV     CX, BX                 ; restore line counter
+    INC     WORD [rnd_pi]
+    MOV     WORD [rnd_off], 0
+    MOV     BX, [rnd_pi]
+    CMP     BX, [pt_count]
+    JAE     .stl_eof
+    JMP     .stl_walk_loop
+
+.stl_scas_found:
+    ; DI = byte after the last LF = start of target line
+    MOV     AX, DI
+    SUB     AX, [rnd_base]         ; AX = piece-relative offset
+    POP     ES
+    ; Normalize: if offset == piece length, advance to next piece
+    MOV     CX, DX
+    SUB     CX, [rnd_base]         ; CX = piece length
+    CMP     AX, CX
+    JB      .stl_scas_ok
+    INC     WORD [rnd_pi]
+    MOV     WORD [rnd_off], 0
+    JMP     .stl_done
+.stl_scas_ok:
+    MOV     [rnd_off], AX
+    JMP     .stl_done
+
+    ; ---- WRAP MODE: byte-by-byte walk ----
+.stl_inner_wrap:
     PUSH    DS
     MOV     DS, AX
     MOV     SI, CS:[rnd_base]
     ADD     SI, CS:[rnd_off]
-.stl_inner:
+.stl_iw_byte:
     CMP     SI, DX
-    JAE     .stl_next_piece
+    JAE     .stl_iw_next_piece
     MOV     AL, [SI]
     INC     SI
     CMP     AL, 0Dh
-    JE      .stl_inner
+    JE      .stl_iw_byte
     CMP     AL, 0Ah
-    JNE     .stl_not_lf
+    JNE     .stl_iw_not_lf
     MOV     WORD CS:[stl_col], 0
     DEC     CX
-    JZ      .stl_found
-    JMP     .stl_inner
-.stl_not_lf:
-    CMP     BYTE CS:[wrap_mode], 0
-    JE      .stl_inner
+    JZ      .stl_iw_found
+    JMP     .stl_iw_byte
+.stl_iw_not_lf:
     INC     WORD CS:[stl_col]
     MOV     AX, CS:[stl_col]
     CMP     AX, SCREEN_COLS
-    JB      .stl_inner
+    JB      .stl_iw_byte
     MOV     WORD CS:[stl_col], 0
     DEC     CX
-    JZ      .stl_found
-    JMP     .stl_inner
-.stl_next_piece:
+    JZ      .stl_iw_found
+    JMP     .stl_iw_byte
+.stl_iw_next_piece:
     POP     DS
-    MOV     BX, CS:[rnd_pi]
-    INC     BX
-    MOV     [rnd_pi], BX
+    INC     WORD [rnd_pi]
     MOV     WORD [rnd_off], 0
+    MOV     BX, [rnd_pi]
     CMP     BX, [pt_count]
     JAE     .stl_eof
     JMP     .stl_walk_loop
-.stl_found:
+.stl_iw_found:
     POP     DS
     SUB     SI, [rnd_base]
-    ; Normalize: if past piece end, advance to next piece
     MOV     AX, DX
-    SUB     AX, [rnd_base]    ; AX = piece length
+    SUB     AX, [rnd_base]         ; AX = piece length
     CMP     SI, AX
-    JB      .stl_found_ok
+    JB      .stl_iw_found_ok
     INC     WORD [rnd_pi]
     MOV     WORD [rnd_off], 0
     JMP     .stl_done
-.stl_found_ok:
+.stl_iw_found_ok:
     MOV     [rnd_off], SI
 .stl_done:
     POP     BP
@@ -2201,14 +2497,12 @@ render:
     MOV     AX, [top_line]
     CALL    seek_to_line
     MOV     WORD [rnd_row], 0
+    XOR     DI, DI
 
 .row_loop:
     MOV     AX, [rnd_row]
     CMP     AX, TEXT_ROWS
     JAE     .do_status
-    MOV     CX, SCREEN_COLS * 2
-    MUL     CX
-    MOV     DI, AX
     MOV     AX, BP
     CMP     AX, [total_lines]
     JAE     .blank_row
@@ -2225,6 +2519,7 @@ render:
     MOV     SI, CS:[rnd_base]
     ADD     SI, CS:[rnd_off]
     XOR     CX, CX
+    MOV     AH, ATTR_NORM
 
 .char_loop:
     CMP     CX, SCREEN_COLS
@@ -2237,8 +2532,7 @@ render:
     JE      .char_loop
     CMP     AL, 0Ah
     JE      .row_done_lf
-    MOV     ES:[DI], AL
-    MOV     BYTE ES:[DI+1], ATTR_NORM
+    MOV     ES:[DI], AX
     ADD     DI, 2
     INC     CX
     JMP     .char_loop
@@ -2249,13 +2543,53 @@ render:
     MOV     CS:[rnd_pi], AX
     CMP     AX, CS:[pt_count]
     JAE     .row_done
-    MOV     BX, AX
+
+    ; ---- Inlined resolve_piece ----
     PUSH    CS
     POP     DS
-    PUSH    CX
-    CALL    resolve_piece
-    POP     CX
-    JC      .row_done_com
+    MOV     BX, AX
+
+    ; SI = BX * 10
+    MOV     SI, BX
+    SHL     SI, 1
+    MOV     AX, SI
+    SHL     SI, 1
+    SHL     SI, 1
+    ADD     SI, AX
+
+    ; Read descriptor from pt_seg via ES (temporarily)
+    PUSH    ES
+    MOV     AX, [pt_seg]
+    MOV     ES, AX
+
+    MOV     DX, ES:[SI + PT_F_LENGTH]
+    MOV     AX, ES:[SI + PT_F_START]
+
+    CMP     BYTE ES:[SI + PT_F_SOURCE], 0
+    JNE     .adv_add_src
+
+    ; ---- Source 0: Original buffer ----
+    MOV     BX, ES:[SI + PT_F_START + 2]
+    POP     ES
+
+    MOV     SI, AX
+    AND     SI, 7FFFh
+    SHL     BX, 1
+    TEST    AX, 8000h
+    JZ      .adv_no_hi
+    INC     BX
+.adv_no_hi:
+    SHL     BX, 1
+    MOV     AX, [BX + orig_seg]
+    JMP     .adv_resolved
+
+.adv_add_src:
+    ; ---- Source 1: Add buffer ----
+    POP     ES
+    MOV     SI, AX
+    MOV     AX, [add_seg]
+
+.adv_resolved:
     MOV     [rnd_base], SI
     MOV     [rnd_seg], AX
     ADD     DX, SI
@@ -2263,10 +2597,8 @@ render:
     MOV     WORD [rnd_off], 0
     MOV     DS, AX
     MOV     SI, CS:[rnd_base]
+    MOV     AH, ATTR_NORM
     JMP     .char_loop
-
-.row_done_com:
-    JMP     .row_pad_com
 
 .row_done_lf:
     PUSH    AX
@@ -2338,20 +2670,14 @@ render:
     SUB     AX, CX
     MOV     CX, AX
     JCXZ    .row_next
-.pad_loop:
-    MOV     BYTE ES:[DI], ' '
-    MOV     BYTE ES:[DI+1], ATTR_NORM
-    ADD     DI, 2
-    LOOP    .pad_loop
+    MOV     AX, 0720h
+    REP     STOSW
     JMP     .row_next
 
 .blank_row:
     MOV     CX, SCREEN_COLS
-.blank_loop:
-    MOV     BYTE ES:[DI], ' '
-    MOV     BYTE ES:[DI+1], ATTR_NORM
-    ADD     DI, 2
-    LOOP    .blank_loop
+    MOV     AX, 0720h
+    REP     STOSW
 
 .row_next:
     INC     WORD [rnd_row]
@@ -2488,12 +2814,12 @@ repaint_status PROC
     CALL    wstr_stat
 
 .pad:
-    CMP     DI, SCREEN_ROWS * SCREEN_COLS * 2
-    JAE     .done
-    MOV     BYTE ES:[DI], ' '
-    MOV     BYTE ES:[DI+1], ATTR_STAT
-    ADD     DI, 2
-    JMP     .pad
+    MOV     CX, SCREEN_ROWS * SCREEN_COLS * 2
+    SUB     CX, DI
+    JBE     .done
+    SHR     CX, 1
+    MOV     AX, 7020h
+    REP     STOSW
 
 .done:
     POP     DX
@@ -2507,56 +2833,6 @@ repaint_status PROC
 repaint_status ENDP
 
 ; ============================================================
-; RENDER_FAST_INSERT — paint one character + refresh status bar
-; ============================================================
-
-render_fast_insert PROC
-    PUSH    ES
-    PUSH    DI
-    PUSH    AX
-    PUSH    BX
-
-    ; Check if character is within visible columns
-    MOV     AX, [cur_col]
-    DEC     AX                     ; AX = column of new char
-    CMP     AX, SCREEN_COLS
-    JAE     .offscreen             ; column >= 80, don't paint character
-
-    ; ---- Compute video offset ----
-    PUSH    AX                     ; save column
-    MOV     AX, [cur_line]
-    SUB     AX, [top_line]
-    MOV     BX, SCREEN_COLS * 2
-    MUL     BX
-    MOV     DI, AX
-    POP     AX                     ; restore column
-    SHL     AX, 1
-    ADD     DI, AX
-
-    ; ---- Read character from add buffer ----
-    MOV     AX, [add_seg]
-    MOV     ES, AX
-    MOV     BX, [add_used]
-    DEC     BX
-    MOV     AL, ES:[BX]
-
-    ; ---- Write to video ----
-    MOV     BX, VIDEO_SEG
-    MOV     ES, BX
-    MOV     ES:[DI], AL
-    MOV     BYTE ES:[DI+1], ATTR_NORM
-
-.offscreen:
-    ; Always refresh status bar (column number changed)
-    CALL    repaint_status
-
-    POP     BX
-    POP     AX
-    POP     DI
-    POP     ES
-    RET
-render_fast_insert ENDP
-
 ; ============================================================
 ; CLEAR_SCR
 ; ============================================================
@@ -2565,15 +2841,14 @@ clear_scr:
     PUSH    ES
     PUSH    DI
     PUSH    CX
+    PUSH    AX
     MOV     AX, VIDEO_SEG
     MOV     ES, AX
     XOR     DI, DI
     MOV     CX, SCREEN_ROWS * SCREEN_COLS
-.cl_lp:
-    MOV     BYTE ES:[DI], ' '
-    MOV     BYTE ES:[DI+1], ATTR_NORM
-    ADD     DI, 2
-    LOOP    .cl_lp
+    MOV     AX, 0720h
+    REP     STOSW
+    POP     AX
     POP     CX
     POP     DI
     POP     ES
